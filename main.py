@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """The World Today - one-page front page summing up Saturday 21 November 2026.
 
-Draws a 1024x1024 PNG newspaper front page with PIL only: masthead, two
-lead panels, 36 verified stories in six regional sections, and a world map
-strip with numbered markers for twelve of the stories. Deterministic: all
-text is baked in, no randomness, no network, no clock reads.
+Draws a 1024x1024 PNG newspaper front page using ONLY the Python standard
+library: masthead, two lead panels, 36 verified stories in six regional
+sections, and a world map strip with numbered markers for twelve of the
+stories. No PIL, no third-party imports at all: a hand-rolled pixel buffer,
+drawing primitives, a hand-drawn 5x7 bitmap font and a struct+zlib PNG
+encoder. Deterministic: all text is baked in, no randomness, no network,
+no clock reads.
 
 Run:  python3 main.py
 Writes entry.png to $MAKEFUN_OUTPUT_DIR (default /output).
 """
 
+import math
 import os
-
-from PIL import Image, ImageDraw, ImageFont
+import struct
+import zlib
 
 W = H = 1024
 
@@ -26,27 +30,229 @@ OCEAN = (168, 200, 221)
 LAND = (216, 208, 182)
 LAND_EDGE = (150, 142, 110)
 SECTION_BG = (255, 255, 255)
+WHITE = (255, 255, 255)
+GOLD = (255, 214, 120)
+CREAM = (250, 246, 236)
+BODY_GREY = (60, 60, 60)
+DETAIL_GREY = (70, 70, 70)
+SEPARATOR = (225, 220, 205)
 
 
-def font(size):
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        return ImageFont.load_default()
+class Canvas:
+    """An RGB pixel buffer with small drawing primitives."""
+
+    def __init__(self, w, h, bg):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(w * h * 3)
+        r, g, b = bg
+        for i in range(0, len(self.buf), 3):
+            self.buf[i] = r
+            self.buf[i + 1] = g
+            self.buf[i + 2] = b
+
+    def set(self, x, y, c):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y * self.w + x) * 3
+            self.buf[i] = c[0]
+            self.buf[i + 1] = c[1]
+            self.buf[i + 2] = c[2]
+
+    def rect(self, x0, y0, x1, y1, c):
+        """Filled rectangle; x1/y1 exclusive, clipped to the canvas."""
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(self.w, x1)
+        y1 = min(self.h, y1)
+        for y in range(y0, y1):
+            base = (y * self.w + x0) * 3
+            for x in range(x0, x1):
+                i = base + (x - x0) * 3
+                self.buf[i] = c[0]
+                self.buf[i + 1] = c[1]
+                self.buf[i + 2] = c[2]
+
+    def hline(self, x0, x1, y, c):
+        self.rect(x0, y, x1, y + 1, c)
+
+    def line(self, x0, y0, x1, y1, c):
+        """Bresenham line."""
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            self.set(x0, y0, c)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+
+    def disc(self, cx, cy, r, c):
+        """Filled disc of radius r."""
+        for dy in range(-r, r + 1):
+            dx = int(math.sqrt(r * r - dy * dy))
+            self.rect(cx - dx, cy + dy, cx + dx + 1, cy + dy + 1, c)
+
+    def polygon(self, pts, fill, edge):
+        """Even-odd scanline fill plus an outline."""
+        n = len(pts)
+        y0 = int(min(p[1] for p in pts))
+        y1 = int(max(p[1] for p in pts))
+        for y in range(y0, y1 + 1):
+            xs = []
+            for i in range(n):
+                x0, yy0 = pts[i]
+                x1, yy1 = pts[(i + 1) % n]
+                if (yy0 <= y < yy1) or (yy1 <= y < yy0):
+                    t = (y - yy0) / (yy1 - yy0)
+                    xs.append(x0 + t * (x1 - x0))
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                self.rect(int(xs[k]), y, int(xs[k + 1]) + 1, y + 1, fill)
+        for i in range(n):
+            x0, y0p = pts[i]
+            x1, y1p = pts[(i + 1) % n]
+            self.line(int(x0), int(y0p), int(x1), int(y1p), edge)
 
 
-def text_w(draw, s, f):
-    box = draw.textbbox((0, 0), s, font=f)
-    return box[2] - box[0]
+# ------------------------------------------------------------------ font
+# Hand-drawn 5x7 bitmap glyphs. Each glyph is 7 rows of 5 bits, written
+# left to right, top to bottom. One blank column separates glyphs, so a
+# character cell is 6 units wide and 7 units tall, scaled by `scale`.
+FONT = {
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01110", "10001", "10000", "10000", "10000", "10001", "01110"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01110", "10001", "10000", "10111", "10001", "10001", "01111"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
+    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
+    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
+    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "11011", "10001"),
+    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00110", "01000", "10000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+}
+FONT.update({
+    "a": ("00000", "00000", "01110", "00001", "01111", "10001", "01111"),
+    "b": ("10000", "10000", "11110", "10001", "10001", "10001", "11110"),
+    "c": ("00000", "00000", "01110", "10000", "10000", "10001", "01110"),
+    "d": ("00001", "00001", "01111", "10001", "10001", "10001", "01111"),
+    "e": ("00000", "00000", "01110", "10001", "11111", "10000", "01110"),
+    "f": ("00110", "01001", "01000", "11110", "01000", "01000", "01000"),
+    "g": ("00000", "01111", "10001", "10001", "01111", "00001", "01110"),
+    "h": ("10000", "10000", "11110", "10001", "10001", "10001", "10001"),
+    "i": ("00100", "00000", "01100", "00100", "00100", "00100", "01110"),
+    "j": ("00010", "00000", "00110", "00010", "00010", "10010", "01100"),
+    "k": ("10000", "10000", "10010", "10100", "11000", "10100", "10010"),
+    "l": ("01100", "00100", "00100", "00100", "00100", "00100", "01110"),
+    "m": ("00000", "00000", "11010", "10101", "10101", "10101", "10101"),
+    "n": ("00000", "00000", "11110", "10001", "10001", "10001", "10001"),
+    "o": ("00000", "00000", "01110", "10001", "10001", "10001", "01110"),
+    "p": ("00000", "00000", "11110", "10001", "10001", "11110", "10000"),
+    "q": ("00000", "00000", "01111", "10001", "10001", "01111", "00001"),
+    "r": ("00000", "00000", "10110", "11001", "10000", "10000", "10000"),
+    "s": ("00000", "00000", "01111", "10000", "01110", "00001", "11110"),
+    "t": ("01000", "01000", "11100", "01000", "01000", "01000", "00110"),
+    "u": ("00000", "00000", "10001", "10001", "10001", "10011", "01101"),
+    "v": ("00000", "00000", "10001", "10001", "10001", "01010", "00100"),
+    "w": ("00000", "00000", "10001", "10101", "10101", "10101", "01010"),
+    "x": ("00000", "00000", "10001", "01010", "00100", "01010", "10001"),
+    "y": ("00000", "00000", "10001", "10001", "01111", "00001", "01110"),
+    "z": ("00000", "00000", "11111", "00010", "00100", "01000", "11111"),
+    " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+    ".": ("00000", "00000", "00000", "00000", "00000", "01100", "01100"),
+    ",": ("00000", "00000", "00000", "00000", "01100", "00100", "01000"),
+    ":": ("00000", "01100", "01100", "00000", "01100", "01100", "00000"),
+    ";": ("00000", "01100", "01100", "00000", "01100", "00100", "01000"),
+    "'": ("00100", "00100", "01000", "00000", "00000", "00000", "00000"),
+    "-": ("00000", "00000", "00000", "01110", "00000", "00000", "00000"),
+    "|": ("00100", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "&": ("01100", "10010", "10100", "01000", "10101", "10010", "01101"),
+    "%": ("11001", "11010", "00010", "00100", "01000", "01011", "10011"),
+    "/": ("00001", "00010", "00010", "00100", "01000", "01000", "10000"),
+    "(": ("00010", "00100", "01000", "01000", "01000", "00100", "00010"),
+    ")": ("01000", "00100", "00010", "00010", "00010", "00100", "01000"),
+    "!": ("00100", "00100", "00100", "00100", "00100", "00000", "00100"),
+    "?": ("01110", "10001", "00001", "00010", "00100", "00000", "00100"),
+    "$": ("00100", "01111", "10100", "01110", "00101", "11110", "00100"),
+    "+": ("00000", "00100", "00100", "11111", "00100", "00100", "00000"),
+    "=": ("00000", "00000", "11111", "00000", "11111", "00000", "00000"),
+    "*": ("00000", "10101", "01110", "11111", "01110", "10101", "00000"),
+    "_": ("00000", "00000", "00000", "00000", "00000", "00000", "11111"),
+    '"': ("01010", "01010", "00000", "00000", "00000", "00000", "00000"),
+    "#": ("01010", "01010", "11111", "01010", "11111", "01010", "01010"),
+    ">": ("10000", "01000", "00100", "00010", "00100", "01000", "10000"),
+    "<": ("00001", "00010", "00100", "01000", "00100", "00010", "00001"),
+})
+
+BLANK = FONT[" "]
 
 
-def wrap(draw, s, f, max_w):
+def clean(s):
+    """Fold characters the bitmap font does not carry to ASCII lookalikes."""
+    return s.replace("\u2014", "-").replace("\u2019", "'").replace("\u2018", "'")
+
+
+def text_width(s, scale):
+    if not s:
+        return 0
+    return len(s) * 6 * scale - scale
+
+
+def draw_text(cv, x, y, s, colour, scale):
+    s = clean(s)
+    cx = x
+    for ch in s:
+        rows = FONT.get(ch, BLANK)
+        for row in range(7):
+            bits = rows[row]
+            for col in range(5):
+                if bits[col] == "1":
+                    cv.rect(cx + col * scale, y + row * scale,
+                            cx + (col + 1) * scale, y + (row + 1) * scale,
+                            colour)
+        cx += 6 * scale
+
+
+def wrap(s, scale, max_w):
     """Greedy word wrap; returns list of lines that fit max_w."""
-    words = s.split()
+    words = clean(s).split()
     lines, cur = [], ""
     for word in words:
         trial = word if not cur else cur + " " + word
-        if text_w(draw, trial, f) <= max_w:
+        if text_width(trial, scale) <= max_w:
             cur = trial
         else:
             if cur:
@@ -57,18 +263,39 @@ def wrap(draw, s, f, max_w):
     return lines
 
 
-def fit_line(draw, s, f, max_w):
+def fit_line(s, scale, max_w):
     """Shorten with an ellipsis until the line fits."""
-    if text_w(draw, s, f) <= max_w:
+    s = clean(s)
+    if text_width(s, scale) <= max_w:
         return s
-    while s and text_w(draw, s + "...", f) > max_w:
+    while s and text_width(s + "...", scale) > max_w:
         s = s[:-1]
     return s + "..."
 
 
-def centre(draw, y, s, f, colour, x0=0, x1=W):
-    draw.text(((x0 + x1 - text_w(draw, s, f)) // 2, y), s, font=f, fill=colour)
+def centre(cv, y, s, colour, scale, x0=0, x1=W):
+    draw_text(cv, (x0 + x1 - text_width(s, scale)) // 2, y, s, colour, scale)
 
+
+# -------------------------------------------------------------------- PNG
+def _chunk(tag, data):
+    out = struct.pack(">I", len(data)) + tag + data
+    out += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return out
+
+
+def encode_png(cv):
+    """Encode the canvas as a PNG (filter 0 on every row, zlib level 9)."""
+    raw = bytearray()
+    row_bytes = cv.w * 3
+    for y in range(cv.h):
+        raw.append(0)
+        raw += cv.buf[y * row_bytes:(y + 1) * row_bytes]
+    ihdr = struct.pack(">IIBBBBB", cv.w, cv.h, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + _chunk(b"IEND", b""))
 
 # ---------------------------------------------------------------- stories
 # (number, headline, detail) - every story verified against reports
@@ -219,75 +446,79 @@ AUSTRALIA = [(113, -22), (114, -30), (115, -35), (120, -34), (129, -32),
 CONTINENTS = [NORTH_AMERICA, GREENLAND, SOUTH_AMERICA, AFRICA, EUROPE,
               ASIA, AUSTRALIA]
 
+# ------------------------------------------------------------------ draw
+def frame(cv, x0, y0, x1, y1, c):
+    """1px outline rectangle (x1/y1 inclusive, like the old PIL outlines)."""
+    cv.hline(x0, x1 + 1, y0, c)
+    cv.hline(x0, x1 + 1, y1, c)
+    cv.rect(x0, y0, x0 + 1, y1 + 1, c)
+    cv.rect(x1, y0, x1 + 1, y1 + 1, c)
 
-def draw_masthead(d):
-    d.rectangle([0, 0, W, 108], fill=NAVY)
-    d.rectangle([0, 104, W, 108], fill=RED)
-    centre(d, 12, "THE WORLD TODAY", font(62), (250, 246, 236))
-    centre(d, 76, "SATURDAY  21  NOVEMBER  2026", font(26), (255, 214, 120))
-    d.text((18, 116), "36 STORIES  |  SIX REGIONS  |  ONE DAY",
-           font=font(13), fill=GREY)
+
+def draw_masthead(cv):
+    cv.rect(0, 0, W, 108, NAVY)
+    cv.rect(0, 104, W, 108, RED)
+    centre(cv, 14, "THE WORLD TODAY", CREAM, 8)
+    centre(cv, 74, "SATURDAY  21  NOVEMBER  2026", GOLD, 4)
+    draw_text(cv, 18, 116, "36 STORIES  |  SIX REGIONS  |  ONE DAY",
+              GREY, 2)
     right = "ALL STORIES REPORTED 20-21 NOVEMBER 2026"
-    d.text((W - 18 - text_w(d, right, font(13)), 116), right,
-           font=font(13), fill=GREY)
+    draw_text(cv, W - 18 - text_width(right, 2), 116, right, GREY, 2)
 
 
-def draw_leads(d):
+def draw_leads(cv):
     y0, h = 136, 128
     w = (W - 32 - 10) // 2
     for i, (kicker, head, body) in enumerate(LEADS):
         x0 = 16 + i * (w + 10)
-        d.rectangle([x0, y0, x0 + w, y0 + h], fill=SECTION_BG,
-                    outline=RULE, width=1)
-        d.rectangle([x0, y0, x0 + w, y0 + 24], fill=RED)
-        d.text((x0 + 10, y0 + 5), kicker, font=font(14), fill=(255, 255, 255))
-        lines = wrap(d, head, font(21), w - 20)
+        cv.rect(x0, y0, x0 + w, y0 + h, SECTION_BG)
+        frame(cv, x0, y0, x0 + w - 1, y0 + h - 1, RULE)
+        cv.rect(x0, y0, x0 + w, y0 + 24, RED)
+        draw_text(cv, x0 + 10, y0 + 5, kicker, WHITE, 2)
+        lines = wrap(head, 3, w - 20)
         yy = y0 + 30
         for line in lines[:2]:
-            d.text((x0 + 10, yy), line, font=font(21), fill=INK)
+            draw_text(cv, x0 + 10, yy, line, INK, 3)
             yy += 24
-        blines = wrap(d, body, font(13), w - 20)
+        blines = wrap(body, 2, w - 20)
         yy = y0 + 30 + 2 * 24 + 4
         for line in blines[:3]:
-            d.text((x0 + 10, yy), line, font=font(13), fill=(60, 60, 60))
+            draw_text(cv, x0 + 10, yy, line, BODY_GREY, 2)
             yy += 16
 
 
-def draw_sections(d):
+def draw_sections(cv):
     y0 = 274
     col_w = (W - 32 - 2 * 10) // 3
     row_h = 262
-    f_head = font(15)
-    f_body = font(13)
     for idx, (name, colour, stories) in enumerate(SECTIONS):
         col, row = idx % 3, idx // 3
         x0 = 16 + col * (col_w + 10)
         yy0 = y0 + row * (row_h + 10)
-        d.rectangle([x0, yy0, x0 + col_w, yy0 + row_h], fill=SECTION_BG,
-                    outline=RULE, width=1)
-        d.rectangle([x0, yy0, x0 + col_w, yy0 + 28], fill=colour)
-        d.text((x0 + 10, yy0 + 6), name, font=font(15), fill=(255, 255, 255))
+        cv.rect(x0, yy0, x0 + col_w, yy0 + row_h, SECTION_BG)
+        frame(cv, x0, yy0, x0 + col_w - 1, yy0 + row_h - 1, RULE)
+        cv.rect(x0, yy0, x0 + col_w, yy0 + 28, colour)
+        draw_text(cv, x0 + 10, yy0 + 6, name, WHITE, 2)
         y = yy0 + 34
         for num, head, detail in stories:
             num_s = "%d." % num
-            d.text((x0 + 8, y), num_s, font=f_head, fill=RED)
-            nx = x0 + 8 + text_w(d, "36. ", f_head) + 2
+            draw_text(cv, x0 + 8, y, num_s, RED, 2)
+            nx = x0 + 8 + text_width("36. ", 2) + 2
             tw = x0 + col_w - 8 - nx
-            head = fit_line(d, head, f_head, tw)
-            d.text((nx, y), head, font=f_head, fill=INK)
-            d.text((nx, y + 17), fit_line(d, detail, f_body, tw),
-                   font=f_body, fill=(70, 70, 70))
+            draw_text(cv, nx, y, fit_line(head, 2, tw), INK, 2)
+            draw_text(cv, nx, y + 17, fit_line(detail, 2, tw), DETAIL_GREY, 2)
             y += 37
             if num != stories[-1][0]:
-                d.line([x0 + 8, y - 3, x0 + col_w - 8, y - 3], fill=(225, 220, 205))
+                cv.hline(x0 + 8, x0 + col_w - 8, y - 3, SEPARATOR)
 
 
-def draw_map(d):
+def draw_map(cv):
     y0 = 818
     h = 158
-    d.rectangle([16, y0, W - 16, y0 + h], fill=OCEAN, outline=RULE, width=1)
-    d.text((26, y0 + 6), "THE DAY ON THE MAP  -  12 STORIES MARKED",
-           font=font(14), fill=NAVY)
+    cv.rect(16, y0, W - 16, y0 + h, OCEAN)
+    frame(cv, 16, y0, W - 17, y0 + h - 1, RULE)
+    draw_text(cv, 26, y0 + 6, "THE DAY ON THE MAP  -  12 STORIES MARKED",
+              NAVY, 2)
     mx0, my0, mw, mh = 24, y0 + 26, W - 48, h - 32
 
     def proj(lon, lat):
@@ -297,35 +528,35 @@ def draw_map(d):
 
     for poly in CONTINENTS:
         pts = [proj(lon, lat) for lon, lat in poly]
-        d.polygon(pts, fill=LAND, outline=LAND_EDGE)
-    f_num = font(12)
+        cv.polygon(pts, LAND, LAND_EDGE)
     for num, lon, lat, dx, dy in MARKERS:
         x, y = proj(lon, lat)
-        bx, by = x + dx, y + dy
-        d.ellipse([x - 2, y - 2, x + 2, y + 2], fill=INK)
+        ix, iy = int(x), int(y)
+        bx, by = ix + dx, iy + dy
+        cv.disc(ix, iy, 2, INK)
         if dx or dy:
-            d.line([x, y, bx, by], fill=INK, width=1)
-        d.ellipse([bx - 10, by - 10, bx + 10, by + 10], fill=RED,
-                  outline=(255, 255, 255), width=1)
+            cv.line(ix, iy, bx, by, INK)
+        cv.disc(bx, by, 12, WHITE)
+        cv.disc(bx, by, 11, RED)
         label = str(num)
-        lw = text_w(d, label, f_num)
-        d.text((bx - lw / 2, by - 7), label, font=f_num, fill=(255, 255, 255))
+        lw = text_width(label, 2)
+        draw_text(cv, bx - lw // 2, by - 7, label, WHITE, 2)
 
 
 def main():
-    img = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(img)
-    draw_masthead(d)
-    draw_leads(d)
-    draw_sections(d)
-    draw_map(d)
-    centre(d, 984, "Compiled from published reports of 20-21 November 2026  |  "
-           "The World Today  |  One day, one page", font(12), GREY)
-    d.line([16, 980, W - 16, 980], fill=RULE)
+    cv = Canvas(W, H, PAPER)
+    draw_masthead(cv)
+    draw_leads(cv)
+    draw_sections(cv)
+    draw_map(cv)
+    centre(cv, 984, "Compiled from published reports of 20-21 November 2026  |  "
+           "The World Today  |  One day, one page", GREY, 2)
+    cv.hline(16, W - 16, 980, RULE)
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    img.save(os.path.join(out_dir, "entry.png"), format="PNG",
-             optimize=True)
+    data = encode_png(cv)
+    with open(os.path.join(out_dir, "entry.png"), "wb") as f:
+        f.write(data)
 
 
 if __name__ == "__main__":
